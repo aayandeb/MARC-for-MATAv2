@@ -14,8 +14,8 @@ import { Bus3DLayer, syncBus3DLayer, BUS_3D_LAYER_ID } from "./Bus3DLayer";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5001";
-// OpenFreeMap Positron — free vector style (Carto CDN also works once the MapLibre worker loads)
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/positron";
+// CARTO Voyager includes naturally colored water, parks, land use, and roads.
+const MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 const MEMPHIS: [number, number] = [-90.049, 35.1495]; // [lng, lat]
 const MAP_PITCH = 0; // default load is top-down / 2D-like; user can still tilt
 
