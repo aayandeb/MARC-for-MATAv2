@@ -30,9 +30,12 @@ class GTFSService:
         self._stop_to_trips = defaultdict(set)
         self._shapes = {}
         self._route_to_shape = {}
+        self._route_to_shapes: dict[str, set[str]] = defaultdict(set)
         self._name_to_stop_ids: dict[str, set[str]] = defaultdict(set)
-        # headsign (uppercased) -> route_id, built during trip loading
-        self._headsign_to_route_id: dict[str, str] = {}
+        # headsign (uppercased) -> possible GTFS route_ids (many routes share terminals)
+        self._headsign_to_route_ids: dict[str, set[str]] = defaultdict(set)
+        # lazy cache: route_id -> normalized stop-name tokens for matching
+        self._route_stop_names_norm: dict[str, set[str]] = {}
 
     def load(self):
         if self._loaded:
@@ -101,12 +104,14 @@ class GTFSService:
                 "direction_id": row.get("direction_id", "0").strip(),
                 "shape_id": shape_id,
             }
-            if shape_id and rid not in self._route_to_shape:
-                self._route_to_shape[rid] = shape_id
+            if shape_id:
+                self._route_to_shapes[rid].add(shape_id)
+                if rid not in self._route_to_shape:
+                    self._route_to_shape[rid] = shape_id
 
             headsign = row.get("trip_headsign", "").strip().upper()
-            if headsign and headsign not in self._headsign_to_route_id:
-                self._headsign_to_route_id[headsign] = rid
+            if headsign:
+                self._headsign_to_route_ids[headsign].add(rid)
 
     def _load_stop_times(self):
         rows_by_trip = defaultdict(list)
@@ -172,10 +177,166 @@ class GTFSService:
         return stops[0]["name"], stops[-1]["name"]
 
     def route_for_destination(self, destination: str) -> dict | None:
+        """Return a route only when the headsign uniquely maps to one GTFS route."""
         if not destination:
             return None
-        rid = self._headsign_to_route_id.get(destination.strip().upper())
-        return self._routes.get(rid) if rid else None
+        candidates = self._headsign_to_route_ids.get(destination.strip().upper(), set())
+        if len(candidates) == 1:
+            rid = next(iter(candidates))
+            return self._routes.get(rid)
+        return None
+
+    @staticmethod
+    def _norm_tokens(value: str) -> list[str]:
+        return "".join(ch if ch.isalnum() else " " for ch in value.lower()).split()
+
+    def _route_stop_name_tokens(self, route_id: str) -> set[str]:
+        cached = self._route_stop_names_norm.get(route_id)
+        if cached is not None:
+            return cached
+        tokens: set[str] = set()
+        for stop in self.get_route_stops(route_id):
+            parts = self._norm_tokens(stop["name"])
+            if parts:
+                tokens.add(" ".join(parts))
+        self._route_stop_names_norm[route_id] = tokens
+        return tokens
+
+    def _next_stop_match_score(self, route_id: str, next_stop: str | None) -> float:
+        if not next_stop:
+            return 0.0
+        needle_parts = self._norm_tokens(next_stop)
+        if not needle_parts:
+            return 0.0
+        needle = " ".join(needle_parts)
+        names = self._route_stop_name_tokens(route_id)
+        if needle in names:
+            return 3.0
+        # partial contains either way
+        for name in names:
+            if needle in name or name in needle:
+                return 2.0
+        # token overlap (e.g. POPLAR @ BELVEDERE vs POPLAR AVENUE at BELVEDERE)
+        needle_set = set(needle_parts)
+        best = 0.0
+        for name in names:
+            overlap = len(needle_set & set(name.split()))
+            if overlap >= 2:
+                best = max(best, 1.0 + 0.25 * overlap)
+        return best
+
+    def _min_distance_m_to_shape(self, shape_id: str, lat: float, lng: float) -> float:
+        points = self._shapes.get(shape_id) or []
+        if not points:
+            return float("inf")
+        step = max(1, len(points) // 80)
+        best = float("inf")
+        for i in range(0, len(points), step):
+            plat, plon = points[i]
+            dy = (plat - lat) * 111_320
+            dx = (plon - lng) * 111_320 * math.cos(math.radians(lat))
+            dist = math.hypot(dx, dy)
+            if dist < best:
+                best = dist
+        return best
+
+    def _min_distance_m_to_route(self, route_id: str, lat: float, lng: float) -> float:
+        shape_ids = self._route_to_shapes.get(route_id) or set()
+        if not shape_ids and route_id in self._route_to_shape:
+            shape_ids = {self._route_to_shape[route_id]}
+        best = float("inf")
+        for shape_id in shape_ids:
+            best = min(best, self._min_distance_m_to_shape(shape_id, lat, lng))
+        return best
+
+    def get_route_shape_id(
+        self,
+        route_id: str,
+        lat: float | None = None,
+        lng: float | None = None,
+    ) -> str | None:
+        """Return a shape for the route; prefer the one nearest to lat/lng when given."""
+        shape_ids = list(self._route_to_shapes.get(route_id) or [])
+        if not shape_ids:
+            return self._route_to_shape.get(route_id)
+        if lat is None or lng is None or len(shape_ids) == 1:
+            return shape_ids[0] if shape_ids else self._route_to_shape.get(route_id)
+        return min(
+            shape_ids,
+            key=lambda sid: self._min_distance_m_to_shape(sid, float(lat), float(lng)),
+        )
+
+    def resolve_route_for_vehicle(
+        self,
+        destination: str | None,
+        next_stop: str | None = None,
+        lat: float | None = None,
+        lng: float | None = None,
+        mata_route_id: str | None = None,
+    ) -> dict | None:
+        """
+        Map a live vehicle to a GTFS route.
+
+        Many MATA buses share terminal headsigns like "WILLIAM HUDSON". We only
+        accept a headsign match when unique; otherwise disambiguate with next
+        stop name and proximity to the route shape.
+        """
+        dest = (destination or "").strip().upper()
+        candidates: set[str] = set(self._headsign_to_route_ids.get(dest, set())) if dest else set()
+
+        # Fuzzy headsign: destination often truncates GTFS headsigns
+        if not candidates and dest:
+            for headsign, rids in self._headsign_to_route_ids.items():
+                if dest in headsign or headsign in dest:
+                    candidates |= rids
+
+        if len(candidates) == 1:
+            rid = next(iter(candidates))
+            # Unique headsign can still be wrong (truncated dest / off-route). If the
+            # bus is far from that route, fall through to proximity scoring.
+            if lat is None or lng is None:
+                return self._routes.get(rid)
+            if self._min_distance_m_to_route(rid, float(lat), float(lng)) <= 1200:
+                return self._routes.get(rid)
+            candidates = set(self._routes.keys())
+
+        # MATA idLigne rarely equals GTFS route_id, but try anyway
+        if mata_route_id:
+            by_id = self.get_route_by_id(str(mata_route_id).strip())
+            if by_id and (not candidates or by_id["id"] in candidates):
+                return by_id
+
+        # No headsign candidates — score every route by next-stop + proximity
+        if not candidates:
+            if lat is None or lng is None:
+                return None
+            candidates = set(self._routes.keys())
+
+        scored: list[tuple[float, str]] = []
+        for rid in candidates:
+            score = self._next_stop_match_score(rid, next_stop)
+            if lat is not None and lng is not None:
+                dist = self._min_distance_m_to_route(rid, float(lat), float(lng))
+                # closer to shape → higher score; 0m => +2, 2km => ~0
+                if dist < float("inf"):
+                    score += max(0.0, 2.0 - dist / 1000.0)
+            scored.append((score, rid))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_rid = scored[0]
+        # When searching all routes, require being fairly close to a shape
+        min_score = 1.0 if len(candidates) < len(self._routes) else 1.4
+        if best_score < min_score:
+            return None
+        # If top two are nearly tied, prefer the nearer shape when available
+        if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.15:
+            if lat is not None and lng is not None:
+                a, b = scored[0][1], scored[1][1]
+                if self._min_distance_m_to_route(a, float(lat), float(lng)) > self._min_distance_m_to_route(
+                    b, float(lat), float(lng)
+                ):
+                    best_rid = b
+        return self._routes.get(best_rid)
 
     def get_route_by_id(self, route_id: str) -> dict | None:
         # Try exact match first, then zero-padded variants
@@ -183,9 +344,6 @@ class GTFSService:
             if candidate in self._routes:
                 return self._routes[candidate]
         return None
-
-    def get_route_shape_id(self, route_id: str) -> str | None:
-        return self._route_to_shape.get(route_id)
 
     def get_stops(self):
         return sorted(self._stops.values(), key=lambda s: s["name"])
@@ -196,23 +354,34 @@ class GTFSService:
     def get_shape(self, shape_id):
         return self._shapes.get(shape_id, [])
 
-    def get_route_stops(self, route_id):
+    def get_route_stops(self, route_id, shape_id: str | None = None):
+        """Return ordered stops for a representative trip on this route.
+
+        When shape_id is provided, prefer a trip that uses that shape so stops
+        match the drawn polyline (routes often have IB/OB or branch variants).
+        """
         active = self._active_service_ids()
 
-        # Prefer a trip that runs today; fall back to any trip for this route
-        best_trip = None
-        for trip_id, trip in self._trips.items():
-            if trip["route_id"] != route_id:
-                continue
-            if trip["service_id"] in active:
-                best_trip = trip_id
-                break
-
-        if not best_trip:
+        def pick_trip(require_active: bool, require_shape: bool) -> str | None:
             for trip_id, trip in self._trips.items():
-                if trip["route_id"] == route_id:
-                    best_trip = trip_id
-                    break
+                if trip["route_id"] != route_id:
+                    continue
+                if require_active and trip["service_id"] not in active:
+                    continue
+                if require_shape and shape_id and trip.get("shape_id") != shape_id:
+                    continue
+                return trip_id
+            return None
+
+        best_trip = None
+        if shape_id:
+            best_trip = pick_trip(require_active=True, require_shape=True) or pick_trip(
+                require_active=False, require_shape=True
+            )
+        if not best_trip:
+            best_trip = pick_trip(require_active=True, require_shape=False) or pick_trip(
+                require_active=False, require_shape=False
+            )
 
         if not best_trip:
             return []

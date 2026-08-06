@@ -8,21 +8,28 @@ bp = Blueprint("vehicles", __name__, url_prefix="/api/vehicles")
 
 def _enrich(vehicle: dict) -> dict:
     out = {k: v for k, v in vehicle.items() if k != "_raw"}
-    route = gtfs.route_for_destination(vehicle.get("destination") or "")
-    # Fall back to route_id from the raw vehicle data when headsign doesn't match
-    if not route:
-        raw_route_id = str(vehicle.get("route_id") or "").strip()
-        if raw_route_id:
-            route = gtfs.get_route_by_id(raw_route_id)
+    route = gtfs.resolve_route_for_vehicle(
+        destination=vehicle.get("destination"),
+        next_stop=vehicle.get("next_stop"),
+        lat=vehicle.get("lat"),
+        lng=vehicle.get("lng"),
+        mata_route_id=str(vehicle.get("route_id") or "") or None,
+    )
     if route:
+        out["gtfs_route_id"] = route["id"]
         out["route_short_name"] = route["short_name"]
         out["route_long_name"] = route["long_name"]
         out["route_color"] = route["color"]
         start, end = gtfs.route_terminals(route["id"])
         out["terminal_start"] = start
         out["terminal_end"] = end
-        out["route_shape_id"] = gtfs.get_route_shape_id(route["id"])
+        out["route_shape_id"] = gtfs.get_route_shape_id(
+            route["id"],
+            lat=vehicle.get("lat"),
+            lng=vehicle.get("lng"),
+        )
     else:
+        out["gtfs_route_id"] = None
         out["route_short_name"] = None
         out["route_long_name"] = None
         out["route_color"] = None

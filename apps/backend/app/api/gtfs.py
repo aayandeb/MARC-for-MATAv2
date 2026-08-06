@@ -57,8 +57,9 @@ def get_shape(shape_id: str):
 
 @bp.route("/routes/<path:route_id>/stops", methods=["GET"])
 def get_route_stops(route_id: str):
-    stops = gtfs.get_route_stops(route_id)
-    return jsonify({"route_id": route_id, "stops": stops, "count": len(stops)})
+    shape_id = (request.args.get("shape_id") or "").strip() or None
+    stops = gtfs.get_route_stops(route_id, shape_id=shape_id)
+    return jsonify({"route_id": route_id, "shape_id": shape_id, "stops": stops, "count": len(stops)})
 
 
 @bp.route("/next_departures", methods=["GET"])

@@ -18,6 +18,8 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5001";
 const MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 const MEMPHIS: [number, number] = [-90.049, 35.1495]; // [lng, lat]
 const MAP_PITCH = 0; // default load is top-down / 2D-like; user can still tilt
+/** Highlight color for selected bus / trip-plan routes on the map. */
+const ROUTE_HIGHLIGHT_COLOR = "#F97316";
 
 interface Vehicle {
   id: number;
@@ -27,9 +29,11 @@ interface Vehicle {
   lng: number | null;
   heading: number | null;
   route_id: number | null;
+  gtfs_route_id: string | null;
   route_short_name: string | null;
   route_long_name: string | null;
   route_color: string | null;
+  route_shape_id: string | null;
   terminal_start: string | null;
   terminal_end: string | null;
   destination: string | null;
@@ -97,6 +101,53 @@ function StopDot({ color }: { color: string }) {
       title=""
     />
   );
+}
+
+/** Google Maps–style white stop disc along a highlighted bus route. */
+function BusRouteStopCircle({
+  isNext,
+  faded,
+  title,
+}: {
+  isNext?: boolean;
+  faded?: boolean;
+  title?: string;
+}) {
+  const size = isNext && !faded ? 14 : 10;
+  return (
+    <div
+      title={title}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        background: faded ? "rgba(255,255,255,0.45)" : "#ffffff",
+        border: faded
+          ? "2px solid rgba(15, 23, 42, 0.2)"
+          : isNext
+            ? "3px solid #F97316"
+            : "2px solid rgba(15, 23, 42, 0.55)",
+        boxShadow: faded
+          ? "none"
+          : isNext
+            ? "0 0 0 4px rgba(249, 115, 22, 0.25), 0 1px 4px rgba(0,0,0,0.3)"
+            : "0 1px 4px rgba(0,0,0,0.28)",
+        opacity: faded ? 0.2 : 1,
+      }}
+    />
+  );
+}
+
+function normalizeStopLabel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function stopNameMatches(stopName: string, nextStop: string | null): boolean {
+  if (!nextStop) return false;
+  const a = normalizeStopLabel(stopName);
+  const b = normalizeStopLabel(nextStop);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
 }
 
 function TerminalPin({
@@ -437,6 +488,205 @@ function toLngLatLine(points: [number, number][]): [number, number][] {
   return points.map(([lat, lon]) => [lon, lat]);
 }
 
+function bearingDeg(lng1: number, lat1: number, lng2: number, lat2: number): number {
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δλ = ((lng2 - lng1) * Math.PI) / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+function angleDiffDeg(a: number, b: number): number {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
+
+/** Split a route polyline at the bus: traveled (behind) vs remaining (ahead). */
+function splitRouteAtBus(
+  coords: [number, number][],
+  lng: number,
+  lat: number,
+  heading: number | null
+): { traveled: [number, number][]; remaining: [number, number][] } {
+  if (coords.length < 2) {
+    return { traveled: [], remaining: coords.slice() };
+  }
+
+  let best = {
+    dist2: Infinity,
+    seg: 0,
+    t: 0,
+    x: coords[0][0],
+    y: coords[0][1],
+  };
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i];
+    const [bx, by] = coords[i + 1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = 0;
+    if (len2 > 1e-18) {
+      t = ((lng - ax) * dx + (lat - ay) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+    }
+    const x = ax + t * dx;
+    const y = ay + t * dy;
+    const dist2 = (lng - x) ** 2 + (lat - y) ** 2;
+    if (dist2 < best.dist2) best = { dist2, seg: i, t, x, y };
+  }
+
+  const splitPt: [number, number] = [best.x, best.y];
+  const [aLng, aLat] = coords[best.seg];
+  const [bLng, bLat] = coords[best.seg + 1];
+  const segBearing = bearingDeg(aLng, aLat, bLng, bLat);
+  // Traveling along increasing shape index?
+  const forward =
+    heading == null ? true : angleDiffDeg(heading, segBearing) <= 90;
+
+  const before: [number, number][] = [
+    ...coords.slice(0, best.seg + 1),
+    splitPt,
+  ];
+  const after: [number, number][] = [splitPt, ...coords.slice(best.seg + 1)];
+
+  // Dedupe consecutive identical points
+  const clean = (line: [number, number][]) => {
+    const out: [number, number][] = [];
+    for (const p of line) {
+      const prev = out[out.length - 1];
+      if (!prev || prev[0] !== p[0] || prev[1] !== p[1]) out.push(p);
+    }
+    return out;
+  };
+
+  if (forward) {
+    return { traveled: clean(before), remaining: clean(after) };
+  }
+  return { traveled: clean(after), remaining: clean(before) };
+}
+
+/** Progress along polyline (segment index + t) for a lat/lng. */
+function progressAlongLine(coords: [number, number][], lng: number, lat: number): number {
+  if (coords.length < 2) return 0;
+  let best = { dist2: Infinity, progress: 0 };
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i];
+    const [bx, by] = coords[i + 1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = 0;
+    if (len2 > 1e-18) {
+      t = ((lng - ax) * dx + (lat - ay) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+    }
+    const x = ax + t * dx;
+    const y = ay + t * dy;
+    const dist2 = (lng - x) ** 2 + (lat - y) ** 2;
+    if (dist2 < best.dist2) best = { dist2, progress: i + t };
+  }
+  return best.progress;
+}
+
+function isStopOnTraveledSegment(
+  coords: [number, number][],
+  stopLon: number,
+  stopLat: number,
+  busLng: number,
+  busLat: number,
+  heading: number | null
+): boolean {
+  if (coords.length < 2) return false;
+  const busProgress = progressAlongLine(coords, busLng, busLat);
+  const stopProgress = progressAlongLine(coords, stopLon, stopLat);
+
+  // Same forward/back sense as splitRouteAtBus
+  let bestSeg = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i];
+    const [bx, by] = coords[i + 1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy || 1e-18;
+    let t = ((busLng - ax) * dx + (busLat - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const x = ax + t * dx;
+    const y = ay + t * dy;
+    const d = (busLng - x) ** 2 + (busLat - y) ** 2;
+    if (d < bestDist) {
+      bestDist = d;
+      bestSeg = i;
+    }
+  }
+  const [aLng, aLat] = coords[bestSeg];
+  const [bLng, bLat] = coords[bestSeg + 1];
+  const forward =
+    heading == null ? true : angleDiffDeg(heading, bearingDeg(aLng, aLat, bLng, bLat)) <= 90;
+
+  return forward ? stopProgress < busProgress - 0.02 : stopProgress > busProgress + 0.02;
+}
+
+function minDist2ToPolyline(coords: [number, number][], lng: number, lat: number): number {
+  if (coords.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i];
+    const [bx, by] = coords[i + 1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = 0;
+    if (len2 > 1e-18) {
+      t = ((lng - ax) * dx + (lat - ay) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+    }
+    const x = ax + t * dx;
+    const y = ay + t * dy;
+    const d = (lng - x) ** 2 + (lat - y) ** 2;
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Prefer GTFS shape; if many stops sit off the shape (branch/loop), use stop-to-stop path. */
+function chooseAlignedRouteLine(
+  shapeCoords: [number, number][],
+  stops: Stop[]
+): [number, number][] {
+  if (stops.length >= 2) {
+    const stopLine: [number, number][] = stops.map((s) => [s.lon, s.lat]);
+    if (shapeCoords.length < 2) return stopLine;
+
+    // ~130m in degrees near Memphis (~35°N)
+    const thresh2 = 0.0012 ** 2;
+    let far = 0;
+    for (const s of stops) {
+      if (minDist2ToPolyline(shapeCoords, s.lon, s.lat) > thresh2) far += 1;
+    }
+    if (far / stops.length > 0.12) return stopLine;
+  }
+  return shapeCoords;
+}
+
+function lineFeatureCollection(coords: [number, number][]): FeatureCollection<LineString> {
+  return {
+    type: "FeatureCollection",
+    features:
+      coords.length >= 2
+        ? [
+            {
+              type: "Feature",
+              properties: {},
+              geometry: { type: "LineString", coordinates: coords },
+            },
+          ]
+        : [],
+  };
+}
+
 export default function MapView({
   fromStop,
   toStop,
@@ -453,6 +703,8 @@ export default function MapView({
   const [routeShapes, setRouteShapes] = useState<Record<string, [number, number][]>>({});
   const [routeStops, setRouteStops] = useState<Stop[]>([]);
   const [selectedBusId, setSelectedBusId] = useState<number | null>(null);
+  const [busRouteCoords, setBusRouteCoords] = useState<[number, number][]>([]);
+  const [busRouteStops, setBusRouteStops] = useState<Stop[]>([]);
   const [endpointPopup, setEndpointPopup] = useState<{
     lon: number;
     lat: number;
@@ -476,6 +728,7 @@ export default function MapView({
         0%   { transform: scale(1);   opacity: 0.55; }
         100% { transform: scale(1.7); opacity: 0; }
       }
+      .maplibregl-popup { z-index: 30 !important; }
       .maplibregl-popup-content { padding: 12px 14px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
       .maplibregl-popup-close-button { font-size: 18px; padding: 4px 8px; }
     `;
@@ -605,6 +858,98 @@ export default function MapView({
     [selectedBusId, vehicles]
   );
 
+  // When a bus is clicked: load its GTFS shape + stops for highlight overlay
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!selectedBus) {
+      setBusRouteCoords([]);
+      setBusRouteStops([]);
+      return;
+    }
+
+    const shapeId = selectedBus.route_shape_id;
+    const gtfsRouteId = selectedBus.gtfs_route_id;
+
+    (async () => {
+      try {
+        const shapeCoords: [number, number][] = [];
+        let nextStops: Stop[] = [];
+
+        await Promise.all([
+          (async () => {
+            if (!shapeId) return;
+            const res = await fetch(`${API}/api/shapes/${encodeURIComponent(shapeId)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const points: [number, number][] = data.points ?? [];
+            if (points.length) shapeCoords.push(...toLngLatLine(points));
+          })(),
+          (async () => {
+            if (!gtfsRouteId) return;
+            const qs = shapeId ? `?shape_id=${encodeURIComponent(shapeId)}` : "";
+            const res = await fetch(
+              `${API}/api/routes/${encodeURIComponent(gtfsRouteId)}/stops${qs}`
+            );
+            if (!res.ok) return;
+            const data = await res.json();
+            nextStops = data.stops ?? [];
+          })(),
+        ]);
+
+        if (cancelled) return;
+        setBusRouteStops(nextStops);
+        setBusRouteCoords(chooseAlignedRouteLine(shapeCoords, nextStops));
+      } catch {
+        /* ignore */
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedBus?.id, selectedBus?.route_shape_id, selectedBus?.gtfs_route_id]);
+
+  const busRouteSplit = useMemo(() => {
+    if (
+      !selectedBus ||
+      selectedBus.lat == null ||
+      selectedBus.lng == null ||
+      busRouteCoords.length < 2
+    ) {
+      return {
+        traveled: [] as [number, number][],
+        remaining: busRouteCoords,
+      };
+    }
+    return splitRouteAtBus(
+      busRouteCoords,
+      selectedBus.lng,
+      selectedBus.lat,
+      selectedBus.heading
+    );
+  }, [busRouteCoords, selectedBus?.lat, selectedBus?.lng, selectedBus?.heading, selectedBus?.id]);
+
+  const busRouteTraveledGeo = useMemo(
+    () => lineFeatureCollection(busRouteSplit.traveled),
+    [busRouteSplit.traveled]
+  );
+  const busRouteRemainingGeo = useMemo(
+    () => lineFeatureCollection(busRouteSplit.remaining),
+    [busRouteSplit.remaining]
+  );
+
+  // Keep 3D buses above the route highlight
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.getLayer(BUS_3D_LAYER_ID)) return;
+    try {
+      map.moveLayer(BUS_3D_LAYER_ID);
+    } catch {
+      /* ignore */
+    }
+  }, [busRouteCoords, mapReady]);
+
   const handleMapLoad = useCallback(() => {
     const map = mapRef.current?.getMap();
     if (!map) return;
@@ -624,8 +969,20 @@ export default function MapView({
     setMapReady(true);
   }, []);
 
-  const selectedRoute = routeResults.find((r) => r.id === selectedRouteId);
-  const routeColor = selectedRoute?.color ?? "#0959b6";
+  // Soft-focus only when we don't yet have a route to fit
+  useEffect(() => {
+    if (!selectedBus || selectedBus.lat == null || selectedBus.lng == null) return;
+    if (busRouteCoords.length) return;
+    const map = mapRef.current;
+    if (!map) return;
+    map.flyTo({
+      center: [selectedBus.lng, selectedBus.lat],
+      zoom: Math.max(map.getZoom(), 13.5),
+      duration: 700,
+    });
+  }, [selectedBus?.id, busRouteCoords.length]);
+
+  const routeColor = ROUTE_HIGHLIGHT_COLOR;
 
   const interactiveLayerIds = useMemo(
     () => routeResults.filter((r) => routeShapes[r.id]?.length).map((r) => `route-line-${r.id}`),
@@ -640,9 +997,11 @@ export default function MapView({
         onRouteSelect(routeId);
         return;
       }
-      // Clicked empty map — close bus popup
+      // Clicked empty map — close bus popup / route overlay
       if (!e.originalEvent.defaultPrevented) {
         setSelectedBusId(null);
+        setBusRouteCoords([]);
+        setBusRouteStops([]);
         setEndpointPopup(null);
         setStopPopup(null);
       }
@@ -711,9 +1070,9 @@ export default function MapView({
                 id={`route-line-${route.id}`}
                 type="line"
                 paint={{
-                  "line-color": route.color ?? "#0959b6",
-                  "line-width": isSelected ? 6 : 3,
-                  "line-opacity": isSelected ? 1 : 0.5,
+                  "line-color": ROUTE_HIGHLIGHT_COLOR,
+                  "line-width": isSelected ? 7 : 4,
+                  "line-opacity": isSelected ? 1 : 0.55,
                 }}
                 layout={{
                   "line-join": "round",
@@ -723,6 +1082,92 @@ export default function MapView({
                 }}
               />
             </Source>
+          );
+        })}
+
+        <Source id="bus-route-traveled-src" type="geojson" data={busRouteTraveledGeo}>
+          <Layer
+            id="bus-route-traveled-casing"
+            type="line"
+            beforeId={mapReady ? BUS_3D_LAYER_ID : undefined}
+            paint={{
+              "line-color": "#ffffff",
+              "line-width": 10,
+              "line-opacity": busRouteSplit.traveled.length >= 2 ? 0.35 : 0,
+            }}
+            layout={{ "line-join": "round", "line-cap": "round" }}
+          />
+          <Layer
+            id="bus-route-traveled"
+            type="line"
+            beforeId={mapReady ? BUS_3D_LAYER_ID : undefined}
+            paint={{
+              "line-color": ROUTE_HIGHLIGHT_COLOR,
+              "line-width": 5,
+              "line-opacity": busRouteSplit.traveled.length >= 2 ? 0.28 : 0,
+            }}
+            layout={{ "line-join": "round", "line-cap": "round" }}
+          />
+        </Source>
+        <Source id="bus-route-remaining-src" type="geojson" data={busRouteRemainingGeo}>
+          <Layer
+            id="bus-route-remaining-casing"
+            type="line"
+            beforeId={mapReady ? BUS_3D_LAYER_ID : undefined}
+            paint={{
+              "line-color": "#ffffff",
+              "line-width": 12,
+              "line-opacity": busRouteSplit.remaining.length >= 2 ? 0.95 : 0,
+            }}
+            layout={{ "line-join": "round", "line-cap": "round" }}
+          />
+          <Layer
+            id="bus-route-remaining"
+            type="line"
+            beforeId={mapReady ? BUS_3D_LAYER_ID : undefined}
+            paint={{
+              "line-color": ROUTE_HIGHLIGHT_COLOR,
+              "line-width": 7,
+              "line-opacity": busRouteSplit.remaining.length >= 2 ? 1 : 0,
+            }}
+            layout={{ "line-join": "round", "line-cap": "round" }}
+          />
+        </Source>
+        {busRouteStops.map((stop, idx) => {
+          const isNext = stopNameMatches(stop.name, selectedBus?.next_stop ?? null);
+          const faded =
+            !!selectedBus &&
+            selectedBus.lat != null &&
+            selectedBus.lng != null &&
+            busRouteCoords.length >= 2 &&
+            isStopOnTraveledSegment(
+              busRouteCoords,
+              stop.lon,
+              stop.lat,
+              selectedBus.lng,
+              selectedBus.lat,
+              selectedBus.heading
+            );
+          return (
+            <Marker
+              key={`bus-stop-${stop.id}-${idx}`}
+              longitude={stop.lon}
+              latitude={stop.lat}
+              anchor="center"
+              style={{ zIndex: faded ? 0 : 1, opacity: faded ? 0.2 : 1 }}
+              onClick={(e) => {
+                e.originalEvent.stopPropagation();
+                setStopPopup({
+                  lon: stop.lon,
+                  lat: stop.lat,
+                  label: isNext && !faded ? "Next stop" : "Stop",
+                  name: stop.name,
+                });
+                setEndpointPopup(null);
+              }}
+            >
+              <BusRouteStopCircle isNext={isNext && !faded} faded={faded} title={stop.name} />
+            </Marker>
           );
         })}
 
