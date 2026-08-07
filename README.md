@@ -1,6 +1,14 @@
-# MARC for MATA
+# MARC for MATA — Version 2
 
 **MARC** (Memphis **A**ccessibility **R**eporting & **C**ommunity) for **MATA** is a web app for the [Memphis Area Transit Authority](https://www.matatransit.com/): live bus positions on a map, GTFS-based trip planning, and tools for riders to report and track **accessibility** issues (ramps, elevators, crowding, signage, and more).
+
+This repository is **version 2** — continued development of the original Rhodes College Hackathon 2026 project.
+
+### Origin & credits
+
+- **Original project:** [srijoon/MARC-for-MATA](https://github.com/srijoon/MARC-for-MATA) (Hackathon 2026)
+- **Original contributors:** [Srijon Kumar](https://github.com/srijoon) (`noobSrijon`), [Caleb Walters](https://github.com/cwalters04) (`cwalters04`), Sahaf Mahmud, and [Aayan Pratim Deb](https://github.com/aayandeb)
+- **This version (v2):** modified and further developed by **[Aayan Pratim Deb](https://github.com/aayandeb)** (`aayandeb`) — including 3D live bus map, route highlighting, GTFS matching improvements, and related UI/API work
 
 The project is a small monorepo:
 
@@ -12,6 +20,7 @@ The project is a small monorepo:
 ## Features
 
 - **Live vehicles** — Fetches real-time bus positions from MATA’s API, enriches them with GTFS route names, colors, terminals, and shape IDs for map overlays. If the API is empty or errors, the backend falls back to `mock_vehicles.json`.
+- **3D map overlay** — Buses rendered as GLB models on MapLibre with route labels; selecting a bus highlights its path (traveled vs remaining) and stop markers.
 - **Trip planning** — Stop-to-stop and coordinate-based planning using bundled **GTFS** static data (`apps/backend/GTFS/`).
 - **Accessibility reports** — Submit issues tied to a bus/route; optional **photo upload** (GridFS) and **AI-assisted** description and severity (via OpenRouter when configured).
 - **Route insights** — Optional AI summaries of recent reports per route (OpenRouter).
@@ -51,7 +60,7 @@ Reports and GridFS use the MongoDB database named **`marc`** by default (see `ap
 
 | Variable | Purpose |
 |----------|---------|
-| `NEXT_PUBLIC_API_URL` | Backend origin (default **`http://localhost:5001`**). Must be reachable from the browser in dev (CORS is enabled on the API). |
+| `NEXT_PUBLIC_API_URL` | Backend origin (default **`http://localhost:5001`**). Must be reachable from the browser in dev (CORS is enabled on the API). On Vercel this must be set at **build** time to your deployed API URL. |
 | `ADMIN_PASSWORD` | Password for **`POST /api/admin/auth`** used by the admin page. If unset, admin login fails with a server error. |
 
 ---
@@ -62,7 +71,7 @@ Reports and GridFS use the MongoDB database named **`marc`** by default (see `ap
 
 ```bash
 cd apps/backend
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 # Add .env with at least MATA_* and optionally MONGO_URI, OPENROUTER_API_KEY
@@ -100,8 +109,8 @@ Static schedules and shapes live under **`apps/backend/GTFS/`** (`routes.txt`, `
 
 ## Deployment notes
 
-- The backend includes a **`vercel.json`** targeting `wsgi.py` for Vercel’s Python runtime; you still need to configure env vars and a compatible MongoDB in that environment.
-- Production typically uses **`gunicorn`** (listed in `requirements.txt`) in front of the Flask app; tune `create_app` config if you add a `FLASK_ENV`-style switch.
+- Free showcase path: **two Vercel projects** — `apps/frontend` (Next.js) and `apps/backend` (Python via `vercel.json`). Set `NEXT_PUBLIC_API_URL` on the frontend to the backend URL and **redeploy** so it is baked into the build.
+- Production can also use **`gunicorn`** (listed in `requirements.txt`) in front of the Flask app; configure MongoDB and env vars in that environment.
 
 ---
 
