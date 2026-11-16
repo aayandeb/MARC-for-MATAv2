@@ -4,6 +4,8 @@
 
 This repository is **version 2** — continued development of the original Rhodes College Hackathon 2026 project.
 
+**Live website:** [https://marc-mata-bus.vercel.app/](https://marc-mata-bus.vercel.app/)
+
 ### Origin & credits
 
 - **Original project:** [srijoon/MARC-for-MATA](https://github.com/srijoon/MARC-for-MATA) (Hackathon 2026)
