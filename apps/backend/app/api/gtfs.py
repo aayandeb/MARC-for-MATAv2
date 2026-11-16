@@ -5,6 +5,16 @@ from app.services.gtfs_service import gtfs
 bp = Blueprint("gtfs", __name__, url_prefix="/api")
 
 
+def _with_schedule_status(result: dict) -> dict:
+    """Attach schedule freshness so the UI can warn when times may be wrong."""
+    status = gtfs.schedule_status()
+    return {
+        **result,
+        "schedule_outdated": status["outdated"],
+        "schedule_valid_until": status["valid_until"],
+    }
+
+
 @bp.route("/stops", methods=["GET"])
 def list_stops():
     """Return all stops for the search dropdown."""
@@ -30,7 +40,7 @@ def plan_trip():
     if from_stop == to_stop:
         return jsonify({"error": "from_stop and to_stop must be different"}), 400
 
-    return jsonify(gtfs.plan_trip(from_stop, to_stop))
+    return jsonify(_with_schedule_status(gtfs.plan_trip(from_stop, to_stop)))
 
 
 @bp.route("/plan/walk", methods=["GET"])
@@ -46,7 +56,7 @@ def plan_trip_walk():
     except (TypeError, ValueError):
         return jsonify({"error": "from_lat, from_lon, to_lat, to_lon are required floats"}), 400
 
-    return jsonify(gtfs.plan_trip_walk(from_lat, from_lon, to_lat, to_lon))
+    return jsonify(_with_schedule_status(gtfs.plan_trip_walk(from_lat, from_lon, to_lat, to_lon)))
 
 
 @bp.route("/shapes/<path:shape_id>", methods=["GET"])
@@ -70,4 +80,12 @@ def next_departures():
     if not route_id or not from_stop:
         return jsonify({"error": "route_id and from_stop are required"}), 400
     times = gtfs.get_next_departures(route_id, from_stop)
-    return jsonify({"route_id": route_id, "from_stop": from_stop, "departures": times})
+    # times is {"departures": [...], "next_service": ...}; return it flat, which
+    # is the shape the frontend reads.
+    return jsonify({"route_id": route_id, "from_stop": from_stop, **times})
+
+
+@bp.route("/schedule/status", methods=["GET"])
+def schedule_status():
+    """Date range the bundled GTFS schedule covers and whether it includes today."""
+    return jsonify(gtfs.schedule_status())

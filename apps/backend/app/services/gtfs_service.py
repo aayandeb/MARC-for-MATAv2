@@ -4,7 +4,7 @@ import logging
 import math
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import date as date_cls, datetime
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,9 @@ class GTFSService:
         self._routes = {}
         self._trips = {}
         self._calendar = {}
+        # YYYYMMDD -> service_ids added / removed on that date (calendar_dates.txt)
+        self._calendar_added: dict[str, set[str]] = defaultdict(set)
+        self._calendar_removed: dict[str, set[str]] = defaultdict(set)
         self._stop_times_by_trip = {}
         self._stop_to_trips = defaultdict(set)
         self._shapes = {}
@@ -44,10 +47,18 @@ class GTFSService:
         self._load_routes()
         self._load_stops()
         self._load_calendar()
+        self._load_calendar_dates()
         self._load_trips()
         self._load_stop_times()
         self._load_shapes()
         self._loaded = True
+        status = self.schedule_status()
+        if status["outdated"]:
+            logger.warning(
+                "Bundled GTFS schedule covers %s to %s and does not include today. "
+                "Falling back to day-of-week service patterns; run scripts/update_gtfs.py.",
+                status["valid_from"], status["valid_until"],
+            )
         logger.info(
             "GTFS loaded — %d routes, %d stops, %d trips, %d shapes",
             len(self._routes), len(self._stops), len(self._trips), len(self._shapes),
@@ -144,17 +155,76 @@ class GTFSService:
         for shape_id, pts in points_by_shape.items():
             self._shapes[shape_id] = [[lat, lon] for _, lat, lon in sorted(pts)]
 
-    def _active_service_ids(self):
-        today = datetime.now(MEMPHIS_TZ).date()
+    def _load_calendar_dates(self):
+        try:
+            rows = _read_csv("calendar_dates.txt")
+        except FileNotFoundError:
+            return
+        for row in rows:
+            sid = (row.get("service_id") or "").strip()
+            day = (row.get("date") or "").strip()
+            kind = (row.get("exception_type") or "").strip()
+            if not sid or not day:
+                continue
+            if kind == "1":
+                self._calendar_added[day].add(sid)
+            elif kind == "2":
+                self._calendar_removed[day].add(sid)
+
+    def _feed_window(self) -> tuple[str | None, str | None]:
+        """Earliest start and latest end date (YYYYMMDD) across calendar.txt."""
+        if not self._calendar:
+            return None, None
+        return (
+            min(c["start_date"] for c in self._calendar.values()),
+            max(c["end_date"] for c in self._calendar.values()),
+        )
+
+    def schedule_status(self, today: date_cls | None = None) -> dict:
+        """Whether the bundled schedule covers today.
+
+        MATA publishes a rolling window of only a few weeks, so a bundled feed
+        goes out of date quickly. Callers use this to warn riders.
+        """
+        today = today or datetime.now(MEMPHIS_TZ).date()
+        start, end = self._feed_window()
         today_str = today.strftime("%Y%m%d")
+        outdated = not start or not end or not (start <= today_str <= end)
+
+        def iso(d: str | None) -> str | None:
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if d and len(d) == 8 else None
+
+        return {"valid_from": iso(start), "valid_until": iso(end), "outdated": outdated}
+
+    def _active_service_ids_for_date(self, day: date_cls) -> set[str]:
+        """Service IDs running on a date.
+
+        Inside the feed's window this follows calendar.txt plus the
+        calendar_dates.txt exceptions (holidays). Outside the window the feed
+        says nothing, so rather than report "no service" we assume the usual
+        pattern for that day of the week; schedule_status() flags this.
+        """
+        day_str = day.strftime("%Y%m%d")
         day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-        today_col = day_names[today.weekday()]
+        day_col = day_names[day.weekday()]
+        start, end = self._feed_window()
+        in_window = bool(start and end and start <= day_str <= end)
 
         active = set()
         for sid, cal in self._calendar.items():
-            if cal["start_date"] <= today_str <= cal["end_date"] and cal[today_col] == "1":
-                active.add(sid)
+            if cal[day_col] != "1":
+                continue
+            if in_window and not (cal["start_date"] <= day_str <= cal["end_date"]):
+                continue
+            active.add(sid)
+
+        if in_window:
+            active |= self._calendar_added.get(day_str, set())
+            active -= self._calendar_removed.get(day_str, set())
         return active
+
+    def _active_service_ids(self):
+        return self._active_service_ids_for_date(datetime.now(MEMPHIS_TZ).date())
 
     def _expand_stop_ids(self, stop_id: str) -> set[str]:
         stop = self._stops.get(stop_id)
@@ -401,16 +471,6 @@ class GTFSService:
             return int(parts[0]) * 60 + int(parts[1])
         except (ValueError, IndexError):
             return None
-
-    def _active_service_ids_for_date(self, date) -> set[str]:
-        date_str = date.strftime("%Y%m%d")
-        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-        day_col = day_names[date.weekday()]
-        active = set()
-        for sid, cal in self._calendar.items():
-            if cal["start_date"] <= date_str <= cal["end_date"] and cal[day_col] == "1":
-                active.add(sid)
-        return active
 
     def _departures_for_route_on_date(self, route_id: str, from_ids: set[str], active: set[str], after_minutes: int | None = None) -> list[int]:
         deps: list[int] = []

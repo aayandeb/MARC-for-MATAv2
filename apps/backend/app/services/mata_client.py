@@ -92,6 +92,44 @@ def _load_mock() -> list[dict[str, Any]]:
         return []
 
 
+def fetch_vehicle_feed(
+    base_url: str | None,
+    path: str | None,
+    lignes: str | None,
+    *,
+    use_mock: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> dict[str, Any]:
+    """
+    Fetch vehicles and say where they came from.
+
+    source is one of:
+      "live"        - MATA's feed answered (the list may be empty: no buses out)
+      "unavailable" - the feed is not configured, errored, or sent bad data
+      "mock"        - bundled demo data, only when use_mock is set explicitly
+
+    Mock data is never substituted silently: a failed feed yields an empty
+    list marked "unavailable" so clients can say so instead of showing fake buses.
+    """
+    if use_mock:
+        return {"vehicles": _load_mock(), "source": "mock"}
+
+    if not base_url or not path:
+        logger.error("MATA feed not configured (MATA_API_BASE_URL / MATA_VEHICLES_PATH)")
+        return {"vehicles": [], "source": "unavailable"}
+
+    try:
+        vehicles = fetch_vehicles(base_url, path, lignes or "", timeout=timeout)
+    except requests.RequestException as e:
+        logger.error("MATA feed request failed: %s", e)
+        return {"vehicles": [], "source": "unavailable"}
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        logger.error("MATA feed returned unusable data: %s", e)
+        return {"vehicles": [], "source": "unavailable"}
+
+    return {"vehicles": vehicles, "source": "live"}
+
+
 def fetch_vehicles_safe(
     base_url: str,
     path: str,
@@ -99,14 +137,5 @@ def fetch_vehicles_safe(
     *,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> list[dict[str, Any]]:
-    try:
-        vehicles = fetch_vehicles(base_url, path, lignes, timeout=timeout)
-        if not vehicles:
-            logger.warning("No vehicles found, loading mock data")
-            return _load_mock()
-        return vehicles
-    except requests.RequestException as e:
-        logger.error(f"Request exception: {e}")
-        return _load_mock()
-    except (KeyError, TypeError, ValueError) as e:
-        return _load_mock()
+    """Fetch live vehicles; return an empty list on any failure."""
+    return fetch_vehicle_feed(base_url, path, lignes, timeout=timeout)["vehicles"]

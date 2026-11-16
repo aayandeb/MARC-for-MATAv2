@@ -1,6 +1,6 @@
 from flask import Blueprint, current_app, jsonify
 
-from app.services import fetch_vehicles_safe
+from app.services import fetch_vehicle_feed
 from app.services.gtfs_service import gtfs
 
 bp = Blueprint("vehicles", __name__, url_prefix="/api/vehicles")
@@ -42,12 +42,17 @@ def _enrich(vehicle: dict) -> dict:
 @bp.route("", methods=["GET"])
 @bp.route("/", methods=["GET"])
 def list_vehicles():
-    vehicles = fetch_vehicles_safe(
+    feed = fetch_vehicle_feed(
         base_url=current_app.config["MATA_API_BASE_URL"],
         path=current_app.config["MATA_VEHICLES_PATH"],
         lignes=current_app.config["MATA_LIGNES"],
+        use_mock=current_app.config.get("USE_MOCK_VEHICLES", False),
     )
+    vehicles = feed["vehicles"]
     return jsonify({
         "vehicles": [_enrich(v) for v in vehicles],
         "count": len(vehicles),
+        # "live" | "unavailable" | "mock" — clients must not present
+        # anything other than "live" as real-time positions.
+        "source": feed["source"],
     })

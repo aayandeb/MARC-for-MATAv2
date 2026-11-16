@@ -21,6 +21,12 @@ const MAP_PITCH = 0; // default load is top-down / 2D-like; user can still tilt
 /** Highlight color for selected bus / trip-plan routes on the map. */
 const ROUTE_HIGHLIGHT_COLOR = "#F97316";
 
+/**
+ * Where the bus positions came from. Only "live" is real-time MATA data;
+ * "mock" is bundled demo data and "unavailable" means the feed could not be read.
+ */
+type FeedStatus = "loading" | "live" | "unavailable" | "mock";
+
 interface Vehicle {
   id: number;
   equipment_number: string;
@@ -700,6 +706,7 @@ export default function MapView({
   const bus3dLayerRef = useRef<Bus3DLayer | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const [feedStatus, setFeedStatus] = useState<FeedStatus>("loading");
   const [routeShapes, setRouteShapes] = useState<Record<string, [number, number][]>>({});
   const [routeStops, setRouteStops] = useState<Stop[]>([]);
   const [selectedBusId, setSelectedBusId] = useState<number | null>(null);
@@ -738,11 +745,16 @@ export default function MapView({
   const refreshVehicles = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/vehicles`);
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(`vehicles request failed: ${res.status}`);
       const data = await res.json();
+      const source: FeedStatus =
+        data.source === "mock" || data.source === "unavailable" ? data.source : "live";
       setVehicles(data.vehicles ?? []);
+      setFeedStatus(source);
     } catch {
-      /* ignore */
+      // Don't leave stale positions on the map looking live.
+      setVehicles([]);
+      setFeedStatus("unavailable");
     }
   }, []);
 
@@ -1322,10 +1334,39 @@ export default function MapView({
         )}
       </Map>
 
-      {vehicles.length > 0 && (
-        <div className="absolute top-3 left-3 z-[1000] bg-white/90 backdrop-blur-sm shadow-sm rounded-full px-3 py-1 flex items-center gap-1.5 text-xs font-bold text-primary">
-          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-          {vehicles.length} buses live
+      {feedStatus !== "loading" && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`absolute top-3 left-3 z-[1000] bg-white/90 backdrop-blur-sm shadow-sm rounded-full px-3 py-1 flex items-center gap-1.5 text-xs font-bold ${
+            feedStatus === "live" && vehicles.length > 0
+              ? "text-primary"
+              : feedStatus === "live"
+              ? "text-on-surface-variant"
+              : "text-amber-800"
+          }`}
+        >
+          {feedStatus === "live" && vehicles.length > 0 ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              {vehicles.length} bus{vehicles.length === 1 ? "" : "es"} live
+            </>
+          ) : feedStatus === "live" ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-on-surface-variant/40" />
+              No buses in service right now
+            </>
+          ) : feedStatus === "mock" ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-amber-500" />
+              Demo data — not live positions
+            </>
+          ) : (
+            <>
+              <span className="w-2 h-2 rounded-full bg-amber-500" />
+              Live bus data unavailable
+            </>
+          )}
         </div>
       )}
 

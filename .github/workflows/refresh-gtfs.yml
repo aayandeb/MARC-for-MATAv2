@@ -1,0 +1,67 @@
+name: Refresh GTFS schedule
+
+# MATA publishes only about three weeks of schedule at a time, so the bundled
+# copy in apps/backend/GTFS must be refreshed regularly or the trip planner
+# drifts out of date. This downloads the current feed, runs the backend tests
+# against it, and commits it to main if anything changed.
+
+on:
+  schedule:
+    # Mondays 09:17 UTC (about 3-4 AM in Memphis, before morning service).
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-gtfs
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/backend
+    env:
+      # Tracked .pyc files exist in this repo; don't let test runs touch them.
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: apps/backend/requirements*.txt
+
+      - name: Download and validate MATA's feed
+        run: python scripts/update_gtfs.py
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if [ -n "$(git status --porcelain -- GTFS)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --short -- GTFS
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Feed is unchanged; nothing to commit."
+          fi
+
+      - name: Run backend tests against the new feed
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest -q -p no:cacheprovider
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- GTFS
+          git commit -m "Refresh GTFS schedule from MATA feed"
+          git push
