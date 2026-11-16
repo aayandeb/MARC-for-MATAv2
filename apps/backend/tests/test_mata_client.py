@@ -9,6 +9,7 @@ import pytest
 from app.services.mata_client import (
     _parse_status,
     _parse_vehicle,
+    fetch_vehicle_feed,
     fetch_vehicles,
     fetch_vehicles_safe,
 )
@@ -215,3 +216,55 @@ class TestFetchVehiclesSafe:
         result = fetch_vehicles_safe("https://example.com", "/v", "x")
 
         assert result == []
+
+
+class TestFetchVehicleFeed:
+    """The feed must say where its data came from and never fake live buses."""
+
+    @patch("app.services.mata_client.requests.get")
+    def test_live_feed_is_marked_live(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"vehicule": [SAMPLE_RAW_VEHICLE]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        feed = fetch_vehicle_feed("https://example.com", "/v", "x")
+
+        assert feed["source"] == "live"
+        assert len(feed["vehicles"]) == 1
+
+    @patch("app.services.mata_client.requests.get")
+    def test_empty_live_feed_stays_live_and_empty(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"vehicule": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        feed = fetch_vehicle_feed("https://example.com", "/v", "x")
+
+        assert feed == {"vehicles": [], "source": "live"}
+
+    @patch("app.services.mata_client.requests.get")
+    def test_feed_error_is_unavailable_not_mock(self, mock_get):
+        import requests as requests_module
+
+        mock_get.side_effect = requests_module.ConnectionError("down")
+
+        feed = fetch_vehicle_feed("https://example.com", "/v", "x")
+
+        assert feed == {"vehicles": [], "source": "unavailable"}
+
+    @patch("app.services.mata_client.requests.get")
+    def test_missing_config_is_unavailable(self, mock_get):
+        feed = fetch_vehicle_feed(None, None, None)
+
+        assert feed == {"vehicles": [], "source": "unavailable"}
+        mock_get.assert_not_called()
+
+    @patch("app.services.mata_client.requests.get")
+    def test_mock_only_when_requested_and_labelled(self, mock_get):
+        feed = fetch_vehicle_feed("https://example.com", "/v", "x", use_mock=True)
+
+        assert feed["source"] == "mock"
+        assert len(feed["vehicles"]) > 0
+        mock_get.assert_not_called()

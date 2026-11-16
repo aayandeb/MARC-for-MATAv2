@@ -73,6 +73,16 @@ interface PlanResult {
   transfers: TransferOption[];
   from_walk?: WalkLeg;
   to_walk?: WalkLeg;
+  /** True when the server's schedule data does not cover today. */
+  schedule_outdated?: boolean;
+  /** Last date (YYYY-MM-DD) the server's schedule data covers. */
+  schedule_valid_until?: string | null;
+}
+
+function formatScheduleDate(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  if (!y || !m || !d) return iso;
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
 interface Report {
@@ -457,14 +467,17 @@ export default function Sidebar({
     function fetchVehicles() {
       fetch(`${API}/api/vehicles`)
         .then((r) => r.json())
-        .then((data: { vehicles: Vehicle[] }) => {
+        .then((data: { vehicles: Vehicle[]; source?: string }) => {
           const names = new Set<string>();
-          for (const v of data.vehicles ?? []) {
-            if (v.route_short_name) names.add(v.route_short_name);
+          // Only real feed data may mark a route as "Live now".
+          if (!data.source || data.source === "live") {
+            for (const v of data.vehicles ?? []) {
+              if (v.route_short_name) names.add(v.route_short_name);
+            }
           }
           setLiveShortNames(names);
         })
-        .catch(() => {});
+        .catch(() => setLiveShortNames(new Set()));
     }
     fetchVehicles();
     const id = setInterval(fetchVehicles, 15_000);
@@ -651,6 +664,20 @@ export default function Sidebar({
         {/* Results */}
         {planResult && (
           <div className="flex-1 overflow-y-auto flex flex-col gap-3 min-h-0">
+
+            {/* Schedule data is past its published date range */}
+            {planResult.schedule_outdated && (
+              <div role="status" className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                <span className="material-symbols-outlined text-[16px] text-amber-700 shrink-0 mt-px">schedule</span>
+                <p className="text-[11px] text-amber-900 leading-snug">
+                  Schedule data may be out of date
+                  {planResult.schedule_valid_until
+                    ? ` (last updated for service through ${formatScheduleDate(planResult.schedule_valid_until)})`
+                    : ""}
+                  . Routes and times are based on the usual pattern for this day — confirm with MATA before you travel.
+                </p>
+              </div>
+            )}
 
             {/* Not possible */}
             {planResult.type === "none" && (
