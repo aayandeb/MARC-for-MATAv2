@@ -29,13 +29,13 @@ jobs:
       # Tracked .pyc files exist in this repo; don't let test runs touch them.
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      # No pip cache: dependencies are only installed when the feed changed,
+      # and the cache step fails the job when there is nothing to save.
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: apps/backend/requirements*.txt
 
       - name: Download and validate MATA's feed
         run: python scripts/update_gtfs.py
